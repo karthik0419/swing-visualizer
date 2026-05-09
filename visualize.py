@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data.fetcher import fetch_cached
+from data.loader import _resample_weekly
 
 CHARTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
@@ -353,7 +354,7 @@ PATTERN_DRAWERS = {
 #  CHART GENERATOR
 # ──────────────────────────────────────────────
 
-def generate_chart(row, df, out_dir):
+def generate_chart(row, df, out_dir, tail_bars=80, timeframe="daily"):
     symbol   = str(row["symbol"])
     pattern  = str(row["pattern"])
     cmp      = float(row["cmp"])
@@ -366,7 +367,7 @@ def generate_chart(row, df, out_dir):
     rsi      = float(row["rsi"])
     reasons  = str(row.get("reasons", ""))
 
-    df_plot = df.tail(80).copy()
+    df_plot = df.tail(tail_bars).copy()
     df_plot.index = pd.DatetimeIndex(df_plot.index)
     df_plot = df_plot[["Open", "High", "Low", "Close", "Volume"]].astype(float)
 
@@ -414,7 +415,7 @@ def generate_chart(row, df, out_dir):
     # ── Title ──
     sym_clean = symbol.replace(".NS", "").replace(".BO", "")
     fig.suptitle(
-        f"{sym_clean}  |  {pattern}  |  Score: {score:.0f}  |  RR: {rr}  |  Upside: {upside}%  |  RSI: {rsi}",
+        f"{sym_clean}  |  {pattern}  |  {timeframe.upper()}  |  Score: {score:.0f}  |  RR: {rr}  |  Upside: {upside}%  |  RSI: {rsi}",
         fontsize=11, color="#c9d1d9", fontweight="bold", y=0.98,
     )
 
@@ -451,18 +452,26 @@ def generate_chart(row, df, out_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv",    required=True, help="Path to results CSV from screener")
-    parser.add_argument("--top",    type=int, default=15)
-    parser.add_argument("--outdir", default=CHARTS_DIR)
+    parser.add_argument("--csv",       required=True, help="Path to results CSV from screener")
+    parser.add_argument("--top",       type=int, default=15)
+    parser.add_argument("--outdir",    default=CHARTS_DIR)
+    parser.add_argument("--timeframe", choices=["daily", "weekly"], default="daily")
     args = parser.parse_args()
 
     if not os.path.exists(args.csv):
         print(f"CSV not found: {args.csv}")
         sys.exit(1)
 
-    os.makedirs(args.outdir, exist_ok=True)
+    tf = args.timeframe
+    days = 400 if tf == "weekly" else 120
+    tail_bars = 60 if tf == "weekly" else 80
+
+    dated_dir = os.path.join(args.outdir, str(date.today()), tf)
+    os.makedirs(dated_dir, exist_ok=True)
+    args.outdir = dated_dir
 
     print(f"Reading: {args.csv}")
+    print(f"Timeframe: {tf.upper()}\n")
     results = pd.read_csv(args.csv).head(args.top)
     print(f"Generating charts for {len(results)} stocks...\n")
 
@@ -471,12 +480,14 @@ def main():
         sym = row["symbol"]
         print(f"  {sym}...", end=" ", flush=True)
         try:
-            df = fetch_cached(sym, days=120)
+            df = fetch_cached(sym, days=days)
+            if tf == "weekly":
+                df = _resample_weekly(df) if df is not None else None
             if df is None or len(df) < 40:
                 print("no data")
                 fail += 1
                 continue
-            fname = generate_chart(row, df, args.outdir)
+            fname = generate_chart(row, df, args.outdir, tail_bars=tail_bars, timeframe=tf)
             print(f"saved -> {os.path.basename(fname)}")
             ok += 1
         except Exception as e:
