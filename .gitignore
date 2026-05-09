@@ -1,0 +1,5 @@
+charts/
+cache/
+__pycache__/
+*.pyc
+*.csv
