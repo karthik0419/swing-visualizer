@@ -1,24 +1,25 @@
 """
-Swing Visualizer — Standalone
-Reads a results CSV (from any screener), fetches OHLCV data independently,
-and generates annotated candlestick charts saved as PNG files.
+Swing Visualizer — Standalone with Pattern Overlays
+Reads a results CSV, fetches OHLCV, generates annotated candlestick charts
+with actual pattern shapes drawn on them.
 
 Usage:
   python visualize.py --csv results_2026-05-09.csv
   python visualize.py --csv results_2026-05-09.csv --top 10
-  python visualize.py --csv results_2026-05-09.csv --outdir my_charts
 """
 
-import sys, os, argparse, glob, warnings
-if sys.stdout.encoding != "utf-8":
-    sys.stdout.reconfigure(encoding="utf-8")
+import sys, os, argparse, warnings
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import mplfinance as mpf
 from datetime import date
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -65,7 +66,7 @@ PATTERN_COLOR = {
 
 
 # ──────────────────────────────────────────────
-#  HELPERS
+#  LEVEL HELPERS
 # ──────────────────────────────────────────────
 
 def _hline(ax, y, color, label, linestyle="--", linewidth=1.2):
@@ -78,8 +79,278 @@ def _hline(ax, y, color, label, linestyle="--", linewidth=1.2):
     )
 
 
+def _shade_region(ax, x0, x1, y0, y1, color, alpha=0.12):
+    ax.axvspan(x0, x1, ymin=0, ymax=1, color=color, alpha=0.0)  # no full span
+    ax.fill_betweenx([y0, y1], x0, x1, color=color, alpha=alpha)
+
+
 # ──────────────────────────────────────────────
-#  CHART
+#  PATTERN OVERLAY DRAWERS
+# ──────────────────────────────────────────────
+
+def _draw_cup_handle(ax, df_plot, breakout_level, pat_color):
+    n = len(df_plot)
+    closes = df_plot["Close"].values
+    highs  = df_plot["High"].values
+    lows   = df_plot["Low"].values
+    xs     = np.arange(n)
+
+    # Find cup region: last 60-70 bars, handle = last 15 bars
+    handle_bars = min(15, n // 5)
+    cup_end     = n - handle_bars
+    cup_start   = max(0, cup_end - 65)
+
+    cup_lows  = lows[cup_start:cup_end]
+    cup_xs    = xs[cup_start:cup_end]
+    bottom_i  = int(np.argmin(cup_lows))
+
+    # Draw smooth cup arc using quadratic curve through 3 points
+    if len(cup_xs) >= 5:
+        x_left   = cup_xs[0]
+        x_bottom = cup_xs[bottom_i]
+        x_right  = cup_xs[-1]
+        y_left   = highs[cup_start]
+        y_bottom = cup_lows[bottom_i]
+        y_right  = highs[cup_end - 1]
+
+        # Bezier-style quadratic arc
+        t = np.linspace(0, 1, 120)
+        arc_x = (1 - t)**2 * x_left + 2 * (1 - t) * t * x_bottom + t**2 * x_right
+        arc_y = (1 - t)**2 * y_left + 2 * (1 - t) * t * y_bottom + t**2 * y_right
+        ax.plot(arc_x, arc_y, color=pat_color, linewidth=1.8, alpha=0.7,
+                linestyle="-", zorder=3, label="Cup")
+
+        # Shade cup interior
+        ax.fill_between(arc_x, arc_y - (y_left - y_bottom) * 0.02, arc_y,
+                         color=pat_color, alpha=0.07)
+
+    # Draw handle box (last handle_bars bars)
+    handle_xs   = xs[cup_end:]
+    handle_high = float(np.max(highs[cup_end:]))
+    handle_low  = float(np.min(lows[cup_end:]))
+    rect = mpatches.FancyBboxPatch(
+        (handle_xs[0] - 0.5, handle_low),
+        handle_xs[-1] - handle_xs[0] + 1,
+        handle_high - handle_low,
+        boxstyle="round,pad=0.3",
+        linewidth=1.4, edgecolor=pat_color, facecolor=pat_color, alpha=0.10,
+    )
+    ax.add_patch(rect)
+    ax.text(handle_xs[0] + (handle_xs[-1] - handle_xs[0]) / 2,
+            handle_high + (handle_high - handle_low) * 0.05,
+            "Handle", fontsize=7, color=pat_color, ha="center", alpha=0.85)
+
+
+def _draw_break_retest(ax, df_plot, breakout_level, pat_color):
+    n = len(df_plot)
+    closes = df_plot["Close"].values
+    highs  = df_plot["High"].values
+    lows   = df_plot["Low"].values
+    xs     = np.arange(n)
+
+    # Find where price first crossed above breakout (the breakout bar)
+    breakout_bar = None
+    for i in range(n - 1, max(n - 30, 0), -1):
+        if closes[i] > breakout_level and (i == 0 or closes[i - 1] <= breakout_level):
+            breakout_bar = i
+            break
+    if breakout_bar is None:
+        for i in range(n - 1, max(n - 30, 0), -1):
+            if highs[i] > breakout_level * 1.01:
+                breakout_bar = i
+                break
+
+    if breakout_bar:
+        # Vertical marker at breakout bar
+        ax.axvline(x=breakout_bar, color=pat_color, linewidth=1.5,
+                   linestyle="-", alpha=0.6, zorder=2)
+        ax.text(breakout_bar, breakout_level * 1.005, " Breakout",
+                fontsize=7, color=pat_color, va="bottom", alpha=0.9)
+
+    # Shade retest zone: between breakout level and current close
+    cur = float(closes[-1])
+    zone_top = max(cur, breakout_level) * 1.015
+    zone_bot = breakout_level * 0.985
+    ax.fill_between(xs, zone_bot, zone_top,
+                    where=np.ones(n, dtype=bool),
+                    color=pat_color, alpha=0.06)
+    ax.annotate("Retest Zone", xy=(n - 1, (zone_top + zone_bot) / 2),
+                fontsize=7, color=pat_color, ha="right", va="center", alpha=0.8)
+
+
+def _draw_channel(ax, df_plot, breakout_level, pat_color):
+    n = len(df_plot)
+    highs = df_plot["High"].values
+    lows  = df_plot["Low"].values
+    xs    = np.arange(n)
+
+    window = 4
+    swing_hi_idx, swing_hi_val = [], []
+    swing_lo_idx, swing_lo_val = [], []
+
+    for i in range(window, n - window):
+        if highs[i] == max(highs[i - window: i + window + 1]):
+            swing_hi_idx.append(i)
+            swing_hi_val.append(highs[i])
+        if lows[i] == min(lows[i - window: i + window + 1]):
+            swing_lo_idx.append(i)
+            swing_lo_val.append(lows[i])
+
+    if len(swing_hi_idx) < 2 or len(swing_lo_idx) < 2:
+        return
+
+    h_slope, h_int = np.polyfit(swing_hi_idx, swing_hi_val, 1)
+    l_slope, l_int = np.polyfit(swing_lo_idx, swing_lo_val, 1)
+
+    upper = h_slope * xs + h_int
+    lower = l_slope * xs + l_int
+
+    ax.plot(xs, upper, color=pat_color, linewidth=1.6, linestyle="--",
+            alpha=0.75, label="Upper Channel", zorder=3)
+    ax.plot(xs, lower, color=pat_color, linewidth=1.6, linestyle="--",
+            alpha=0.75, label="Lower Channel", zorder=3)
+    ax.fill_between(xs, lower, upper, color=pat_color, alpha=0.07)
+
+    ax.text(2, upper[2] + (upper[2] - lower[2]) * 0.05,
+            "Channel", fontsize=7.5, color=pat_color, alpha=0.85)
+
+
+def _draw_triangle(ax, df_plot, breakout_level, pat_color, pattern):
+    n = len(df_plot)
+    highs = df_plot["High"].values
+    lows  = df_plot["Low"].values
+    xs    = np.arange(n)
+
+    window = 3
+    swing_hi_idx, swing_hi_val = [], []
+    swing_lo_idx, swing_lo_val = [], []
+
+    for i in range(window, n - window):
+        if highs[i] == max(highs[i - window: i + window + 1]):
+            swing_hi_idx.append(i)
+            swing_hi_val.append(highs[i])
+        if lows[i] == min(lows[i - window: i + window + 1]):
+            swing_lo_idx.append(i)
+            swing_lo_val.append(lows[i])
+
+    if len(swing_hi_idx) < 2 or len(swing_lo_idx) < 2:
+        return
+
+    h_slope, h_int = np.polyfit(swing_hi_idx, swing_hi_val, 1)
+    l_slope, l_int = np.polyfit(swing_lo_idx, swing_lo_val, 1)
+
+    upper = h_slope * xs + h_int
+    lower = l_slope * xs + l_int
+
+    ax.plot(xs, upper, color=pat_color, linewidth=1.5, linestyle="-",
+            alpha=0.75, zorder=3)
+    ax.plot(xs, lower, color=pat_color, linewidth=1.5, linestyle="-",
+            alpha=0.75, zorder=3)
+    ax.fill_between(xs, lower, upper, color=pat_color, alpha=0.08)
+
+    label = "Flat Resistance" if pattern == "Ascending Triangle" else "Converging"
+    ax.text(xs[len(xs) // 3], upper[len(xs) // 3] * 1.005,
+            label, fontsize=7, color=pat_color, alpha=0.85)
+
+
+def _draw_sr_zone(ax, df_plot, breakout_level, pat_color, pattern):
+    n = len(df_plot)
+    xs = np.arange(n)
+
+    zone_top = breakout_level * 1.02
+    zone_bot = breakout_level * 0.98
+
+    ax.fill_between(xs, zone_bot, zone_top,
+                    color=pat_color, alpha=0.15)
+    ax.axhline(y=breakout_level, color=pat_color,
+               linewidth=1.4, linestyle="-", alpha=0.6)
+
+    label = "Support Zone" if pattern == "S&R Support" else "Resistance Zone"
+    ax.text(2, breakout_level * 1.022, label,
+            fontsize=7.5, color=pat_color, alpha=0.85)
+
+
+def _draw_darvas_box(ax, df_plot, breakout_level, pat_color):
+    n = len(df_plot)
+    highs = df_plot["High"].values
+    lows  = df_plot["Low"].values
+    xs    = np.arange(n)
+
+    # Box: recent 20-bar high/low as the box boundary
+    lookback = min(30, n)
+    box_top = float(np.max(highs[-lookback:]))
+    box_bot = float(np.min(lows[-lookback:]))
+    box_start = n - lookback
+
+    rect = mpatches.Rectangle(
+        (box_start - 0.5, box_bot),
+        lookback,
+        box_top - box_bot,
+        linewidth=1.5, edgecolor=pat_color,
+        facecolor=pat_color, alpha=0.08, zorder=2,
+    )
+    ax.add_patch(rect)
+    ax.text(box_start + lookback / 2, box_top * 1.003,
+            "Darvas Box", fontsize=7.5, color=pat_color,
+            ha="center", alpha=0.85)
+
+
+def _draw_flag(ax, df_plot, breakout_level, pat_color):
+    n = len(df_plot)
+    highs  = df_plot["High"].values
+    lows   = df_plot["Low"].values
+    closes = df_plot["Close"].values
+    xs     = np.arange(n)
+
+    # Flagpole: sharp move up in last 15-30 bars before consolidation
+    flag_bars  = min(15, n // 4)
+    pole_start = max(0, n - flag_bars - 20)
+    pole_end   = max(0, n - flag_bars)
+
+    if pole_start < pole_end:
+        pole_low  = float(np.min(lows[pole_start:pole_end]))
+        pole_high = float(np.max(highs[pole_start:pole_end]))
+        ax.annotate("", xy=(pole_end, pole_high),
+                    xytext=(pole_start, pole_low),
+                    arrowprops=dict(arrowstyle="->", color=pat_color,
+                                   lw=1.5, alpha=0.7))
+        ax.text(pole_start + (pole_end - pole_start) // 2,
+                (pole_high + pole_low) / 2,
+                " Pole", fontsize=7, color=pat_color, alpha=0.8)
+
+    # Flag: consolidation (last flag_bars)
+    flag_xs   = xs[-flag_bars:]
+    flag_high = float(np.max(highs[-flag_bars:]))
+    flag_low  = float(np.min(lows[-flag_bars:]))
+    rect = mpatches.Rectangle(
+        (flag_xs[0] - 0.5, flag_low),
+        flag_bars,
+        flag_high - flag_low,
+        linewidth=1.3, edgecolor=pat_color,
+        facecolor=pat_color, alpha=0.10, zorder=2,
+    )
+    ax.add_patch(rect)
+    ax.text(flag_xs[0] + flag_bars / 2, flag_high * 1.002,
+            "Flag", fontsize=7, color=pat_color, ha="center", alpha=0.85)
+
+
+PATTERN_DRAWERS = {
+    "Cup & Handle":          _draw_cup_handle,
+    "Cup & Handle (Weekly)": _draw_cup_handle,
+    "Break & Retest":        _draw_break_retest,
+    "Channel Breakout":      _draw_channel,
+    "Ascending Triangle":    _draw_triangle,
+    "Symmetrical Triangle":  _draw_triangle,
+    "Darvas Box":            _draw_darvas_box,
+    "S&R Support":           _draw_sr_zone,
+    "S&R Breakout":          _draw_sr_zone,
+    "Bullish Flag":          _draw_flag,
+    "Bullish Pennant":       _draw_flag,
+}
+
+
+# ──────────────────────────────────────────────
+#  CHART GENERATOR
 # ──────────────────────────────────────────────
 
 def generate_chart(row, df, out_dir):
@@ -123,20 +394,31 @@ def generate_chart(row, df, out_dir):
 
     ax = axes[0]
 
-    # Key levels
+    # ── Pattern shape overlay ──
+    drawer = PATTERN_DRAWERS.get(pattern)
+    if drawer:
+        try:
+            if pattern in ("Ascending Triangle", "Symmetrical Triangle", "S&R Support", "S&R Breakout"):
+                drawer(ax, df_plot, breakout, pat_color, pattern)
+            else:
+                drawer(ax, df_plot, breakout, pat_color)
+        except Exception:
+            pass  # never let overlay crash the chart
+
+    # ── Key level lines ──
     _hline(ax, breakout, "#ffd700", "Breakout", linestyle="-",  linewidth=1.8)
     _hline(ax, target,   "#56d364", "Target",   linestyle="--", linewidth=1.2)
     _hline(ax, stop,     "#f78166", "Stop",     linestyle="--", linewidth=1.2)
     _hline(ax, cmp,      "#c9d1d9", "CMP",      linestyle=":",  linewidth=0.9)
 
-    # Title
+    # ── Title ──
     sym_clean = symbol.replace(".NS", "").replace(".BO", "")
     fig.suptitle(
         f"{sym_clean}  |  {pattern}  |  Score: {score:.0f}  |  RR: {rr}  |  Upside: {upside}%  |  RSI: {rsi}",
         fontsize=11, color="#c9d1d9", fontweight="bold", y=0.98,
     )
 
-    # Reasons strip
+    # ── Reasons strip ──
     if reasons and reasons != "nan":
         ax.text(
             0.01, 0.03, reasons,
@@ -146,7 +428,7 @@ def generate_chart(row, df, out_dir):
             verticalalignment="bottom",
         )
 
-    # Pattern badge
+    # ── Pattern badge ──
     ax.text(
         0.01, 0.97, f"  {pattern}  ",
         transform=ax.transAxes,
@@ -195,7 +477,7 @@ def main():
                 fail += 1
                 continue
             fname = generate_chart(row, df, args.outdir)
-            print(f"saved → {os.path.basename(fname)}")
+            print(f"saved -> {os.path.basename(fname)}")
             ok += 1
         except Exception as e:
             print(f"err: {e}")
