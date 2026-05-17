@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 :: ── Pick latest results CSV ──
-for /f "delims=" %%f in ('dir /b /od "..\swing-screener\results_*.csv" 2^>nul') do set LATEST=%%f
+for /f "delims=" %%f in ('dir /b /od "..\scanner\results_*.csv" 2^>nul') do set LATEST=%%f
 
 if "%LATEST%"=="" (
     echo No results CSV found in swing-screener. Run the screener first.
@@ -35,7 +35,7 @@ echo.
 echo Running %TIMEFRAME% charts...
 echo.
 
-python visualize.py --csv "..\swing-screener\%LATEST%" --timeframe %TIMEFRAME%
+python visualize.py --csv "..\scanner\%LATEST%" --timeframe %TIMEFRAME%
 
 echo.
 echo =============================================
